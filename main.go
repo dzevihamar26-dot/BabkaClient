@@ -28,7 +28,7 @@ const (
 	MINECRAFT_VERSION    = "1.21.4"
 	MOD_FILENAME         = "Babka.jar"
 	WEBHOOK_URL          = "https://discord.com/api/webhooks/1517197930006843452/XrkXazX0Yv0nohPXnz4QlDJUYFAaXbvM6vmhf5ORR4-4ef-oxzoA9cCK0HHQIcju9eFR"
-	LOADER_VERSION       = "8"
+	LOADER_VERSION       = "9"
 	LOADER_NAME          = "BabkaLoader"
 	MAX_DOWNLOAD_RETRIES = 5
 	DOWNLOAD_TIMEOUT     = 10 * time.Minute
@@ -127,9 +127,10 @@ func (l *Logger) SetEnabled(enabled bool) {
 	l.enabled = enabled
 }
 
-func (l *Logger) Log(level, message string) {
+// Логгер пишет только в файл, в консоль ничего не выводит
+func (l *Logger) Log(message string) {
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	logLine := fmt.Sprintf("[%s] [%s] %s\n", timestamp, level, message)
+	logLine := fmt.Sprintf("[%s] %s\n", timestamp, message)
 	l.mu.Lock()
 	if l.enabled && l.file != nil {
 		l.file.WriteString(logLine)
@@ -137,19 +138,16 @@ func (l *Logger) Log(level, message string) {
 	l.mu.Unlock()
 }
 
-func (l *Logger) Info(msg string)  { l.Log("INFO", msg) }
-func (l *Logger) Warn(msg string)  { l.Log("WARN", msg) }
-func (l *Logger) Error(msg string) { l.Log("ERROR", msg) }
+func (l *Logger) Info(msg string) { l.Log(msg) }
 
 type DownloadManager struct {
-	logger   *Logger
 	cacheDir string
 	retries  int
 	timeout  time.Duration
 }
 
-func NewDownloadManager(logger *Logger, cacheDir string) *DownloadManager {
-	return &DownloadManager{logger: logger, cacheDir: cacheDir, retries: MAX_DOWNLOAD_RETRIES, timeout: DOWNLOAD_TIMEOUT}
+func NewDownloadManager(cacheDir string) *DownloadManager {
+	return &DownloadManager{cacheDir: cacheDir, retries: MAX_DOWNLOAD_RETRIES, timeout: DOWNLOAD_TIMEOUT}
 }
 
 func (dm *DownloadManager) DownloadFile(url, destPath string) error {
@@ -219,14 +217,13 @@ func (dm *DownloadManager) downloadOnce(url, destPath string) error {
 
 type LibraryManager struct {
 	installDir string
-	logger     *Logger
 	nativesDir string
 }
 
-func NewLibraryManager(installDir string, logger *Logger) *LibraryManager {
+func NewLibraryManager(installDir string) *LibraryManager {
 	nativesDir := filepath.Join(installDir, "natives")
 	os.MkdirAll(nativesDir, 0755)
-	return &LibraryManager{installDir: installDir, logger: logger, nativesDir: nativesDir}
+	return &LibraryManager{installDir: installDir, nativesDir: nativesDir}
 }
 
 func (lm *LibraryManager) GetNativesDir() string {
@@ -260,13 +257,11 @@ func (lm *LibraryManager) extractNativesFromLibrary(lib Library) {
 		currentOS = "osx"
 	}
 
-	var classifier string
 	var libPath string
 
 	if lib.Natives != nil {
 		if c, ok := lib.Natives[currentOS]; ok {
-			classifier = c
-			libPath = lm.getNativeLibraryPath(lib, classifier)
+			libPath = lm.getNativeLibraryPath(lib, c)
 		}
 	}
 
@@ -426,17 +421,15 @@ func (lm *LibraryManager) getNativeLibraryPath(lib Library, classifier string) s
 type MinecraftLauncher struct {
 	installDir string
 	versionDir string
-	logger     *Logger
 	libraryMgr *LibraryManager
 	config     *Config
 }
 
-func NewMinecraftLauncher(installDir string, logger *Logger, config *Config) *MinecraftLauncher {
+func NewMinecraftLauncher(installDir string, config *Config) *MinecraftLauncher {
 	return &MinecraftLauncher{
 		installDir: installDir,
 		versionDir: filepath.Join(installDir, "versions", "Fabric "+MINECRAFT_VERSION),
-		logger:     logger,
-		libraryMgr: NewLibraryManager(installDir, logger),
+		libraryMgr: NewLibraryManager(installDir),
 		config:     config,
 	}
 }
@@ -458,13 +451,25 @@ func (ml *MinecraftLauncher) Launch() error {
 		classpath = append(classpath, vJar)
 	}
 	args := ml.buildLaunchArgs(&version, classpath)
+
+	// Отключаем внутреннее логирование Minecraft
+	args = append(args, "-Dlog4j.configurationFile=")
+	args = append(args, "-Dfabric.log.level=off")
+	args = append(args, "-Dorg.slf4j.simpleLogger.defaultLogLevel=off")
+
 	javaPath := "java"
 	cmd := exec.Command(javaPath, args...)
 	cmd.Dir = ml.installDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	return cmd.Start()
+	// Отключаем вывод логов Minecraft в консоль лаунчера
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	fmt.Println("Client started")
+	return nil
 }
 
 func (ml *MinecraftLauncher) buildLaunchArgs(version *VersionManifest, classpath []string) []string {
@@ -519,11 +524,14 @@ func (ml *MinecraftLauncher) buildLaunchArgs(version *VersionManifest, classpath
 	args = append(args, "-cp", strings.Join(classpath, cpSep))
 	args = append(args, version.MainClass)
 
+	// Фильтрация --demo и --quickPlay* аргументов
+	quickPlayArgs := []string{"--quickPlayPath", "--quickPlaySingleplayer", "--quickPlayMultiplayer", "--quickPlayRealms"}
+
 	for _, arg := range version.Arguments.Game {
 		switch v := arg.(type) {
 		case string:
 			replaced := ml.replaceGameVars(v, version)
-			if replaced != "--demo" {
+			if replaced != "--demo" && !containsString(quickPlayArgs, replaced) {
 				args = append(args, replaced)
 			}
 		case map[string]interface{}:
@@ -533,14 +541,14 @@ func (ml *MinecraftLauncher) buildLaunchArgs(version *VersionManifest, classpath
 					switch tv := val.(type) {
 					case string:
 						replaced := ml.replaceGameVars(tv, version)
-						if replaced != "--demo" {
+						if replaced != "--demo" && !containsString(quickPlayArgs, replaced) {
 							args = append(args, replaced)
 						}
 					case []interface{}:
 						for _, a := range tv {
 							if s, ok := a.(string); ok {
 								replaced := ml.replaceGameVars(s, version)
-								if replaced != "--demo" {
+								if replaced != "--demo" && !containsString(quickPlayArgs, replaced) {
 									args = append(args, replaced)
 								}
 							}
@@ -574,7 +582,7 @@ func (ml *MinecraftLauncher) replaceVars(arg string, v *VersionManifest) string 
 	arg = strings.ReplaceAll(arg, "${clientid}", "0")
 	arg = strings.ReplaceAll(arg, "${auth_xuid}", "0")
 	arg = strings.ReplaceAll(arg, "${user_type}", "mojang")
-	arg = strings.ReplaceAll(arg, "${version_type}", v.Type)
+	arg = strings.ReplaceAll(arg, "${version_type}", "release")
 	arg = strings.ReplaceAll(arg, "${classpath_separator}", cpSep)
 	return arg
 }
@@ -591,6 +599,13 @@ func (ml *MinecraftLauncher) replaceGameVars(arg string, v *VersionManifest) str
 	arg = strings.ReplaceAll(arg, "${assets_index_name}", v.Assets)
 	arg = strings.ReplaceAll(arg, "${game_directory}", ml.installDir)
 	arg = strings.ReplaceAll(arg, "${assets_root}", filepath.Join(ml.installDir, "assets"))
+	arg = strings.ReplaceAll(arg, "${version_type}", "release")
+	arg = strings.ReplaceAll(arg, "${quickPlayPath}", "")
+	arg = strings.ReplaceAll(arg, "${quickPlaySingleplayer}", "")
+	arg = strings.ReplaceAll(arg, "${quickPlayMultiplayer}", "")
+	arg = strings.ReplaceAll(arg, "${quickPlayRealms}", "")
+	arg = strings.ReplaceAll(arg, "${resolution_width}", "854")
+	arg = strings.ReplaceAll(arg, "${resolution_height}", "480")
 	return arg
 }
 
@@ -615,11 +630,10 @@ func isPlatformCompatible(arg string) bool {
 
 type ModManager struct {
 	installDir string
-	logger     *Logger
 }
 
-func NewModManager(installDir string, logger *Logger) *ModManager {
-	return &ModManager{installDir: installDir, logger: logger}
+func NewModManager(installDir string) *ModManager {
+	return &ModManager{installDir: installDir}
 }
 
 func (mm *ModManager) IsModInstalled(modName string) bool {
@@ -628,12 +642,11 @@ func (mm *ModManager) IsModInstalled(modName string) bool {
 
 type FabricManager struct {
 	installDir string
-	logger     *Logger
 	dlManager  *DownloadManager
 }
 
-func NewFabricManager(installDir string, logger *Logger, dl *DownloadManager) *FabricManager {
-	return &FabricManager{installDir: installDir, logger: logger, dlManager: dl}
+func NewFabricManager(installDir string, dl *DownloadManager) *FabricManager {
+	return &FabricManager{installDir: installDir, dlManager: dl}
 }
 
 func (fm *FabricManager) IsFabricInstalled() bool {
@@ -757,6 +770,15 @@ func checkOsRules(rules []LibraryRule) bool {
 	return allowFound
 }
 
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
 func extractZip(zipFile, destDir string) error {
 	r, err := zip.OpenReader(zipFile)
 	if err != nil {
@@ -829,15 +851,15 @@ var (
 
 const asciiArt = `
  ██████╗  █████╗ ██████╗ ██╗  ██╗ █████╗      ██████╗██╗     ██╗███████╗███╗   ██╗████████╗
- ██╔══██╗██╔══██╗██╔══██╗██║ ██╔╝██╔══██╗    ██╔════╝██║     ██║██╔════╝████╗  ██║╚══██══╝
+ ██╔══██╗██══██╗██╔══██╗██║ ██╔╝██╔══██╗    ██╔════╝██║     ██║██╔════╝████╗  ██║╚══██══╝
  ██████╔╝███████║██████╔╝█████╔╝ ███████║    ██║     ██║     ██║█████╗  ██╔██╗ ██║   ██║   
- ██╔══██╗██╔══██║██╔══██╗██╔═██╗ ██╔══██║    ██║     ██║     ██║██╔══╝  ██║╚██╗██║   ██║   
- ██████╔╝██║  ██║██████╔╝██║  ██╗██║  ██║    ╚██████╗███████╗██║███████╗██║ ╚████║   ██║   
- ╚═════╝ ╚═╝  ╚═╝═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝     ═════╝╚══════╝╚═╝╚══════╝╚═╝  ═══╝   ╚═╝   
+ ██╔══██╗██╔══██║██╔══██╗██╔═██╗ ██╔══██║    ██║     ██║     ██║██╔══╝  ██║██╗██║   ██║   
+ ██████╝██║  ██║██████╔╝██║  ██╗██║  ██║    ██████╗███████╗██║███████╗██║ ╚████║   ██║   
+ ╚═════╝ ╚═╝  ╚═╝═════╝ ╚═╝  ═╝╚═╝  ╚═╝     ═════╝╚══════╝╚═╝╚══════╝╚═╝  ═══╝   ╚═╝   
 `
 
 // ============================================================================
-// СИСТЕМНАЯ ИНФОРМАЦИЯ - всегда актуальные данные
+// СИСТЕМНАЯ ИНФОРМАЦИЯ
 // ============================================================================
 
 func getSystemName() string {
@@ -882,6 +904,7 @@ func getCPU() string {
 	if runtime.GOOS != "windows" {
 		return "Unknown"
 	}
+	// Попытка 1: wmic
 	if out, err := exec.Command("wmic", "cpu", "get", "name").Output(); err == nil {
 		for _, l := range strings.Split(string(out), "\n") {
 			l = strings.TrimSpace(l)
@@ -890,6 +913,7 @@ func getCPU() string {
 			}
 		}
 	}
+	// Попытка 2: PowerShell
 	if out, err := exec.Command("powershell", "-NoProfile", "-Command",
 		"(Get-CimInstance Win32_Processor).Name").Output(); err == nil {
 		name := strings.TrimSpace(string(out))
@@ -897,6 +921,7 @@ func getCPU() string {
 			return name
 		}
 	}
+	// Попытка 3: Registry
 	if out, err := exec.Command("reg", "query",
 		`HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0`,
 		"/v", "ProcessorNameString").Output(); err == nil {
@@ -1144,11 +1169,11 @@ func launchClient() {
 		readInput()
 		return
 	}
-	modMgr := NewModManager(config.InstallDir, logger)
+	modMgr := NewModManager(config.InstallDir)
 	if !modMgr.IsModInstalled(MOD_FILENAME) {
 		fmt.Println("  Client mod not found. Downloading...")
 		zipPath := filepath.Join(config.InstallDir, "client-temp.zip")
-		dlMgr := NewDownloadManager(logger, filepath.Join(getAppConfigDir(), "cache"))
+		dlMgr := NewDownloadManager(filepath.Join(getAppConfigDir(), "cache"))
 		if err := dlMgr.DownloadFile(CLIENT_URL, zipPath); err != nil {
 			fmt.Printf("  Failed to download: %v\n  Press Enter...", err)
 			readInput()
@@ -1172,11 +1197,12 @@ func launchClient() {
 	} else {
 		fmt.Printf("  Found %s in mods folder\n", MOD_FILENAME)
 	}
-	fabricMgr := NewFabricManager(config.InstallDir, logger, nil)
+	fabricMgr := NewFabricManager(config.InstallDir, nil)
 	if !fabricMgr.IsFabricInstalled() {
 		fmt.Println("  Fabric not installed. Installing...")
-		dlMgr := NewDownloadManager(logger, filepath.Join(getAppConfigDir(), "cache"))
-		if err := NewFabricManager(config.InstallDir, logger, dlMgr).InstallFabric(); err != nil {
+		dlMgr := NewDownloadManager(filepath.Join(getAppConfigDir(), "cache"))
+		fabricMgr = NewFabricManager(config.InstallDir, dlMgr)
+		if err := fabricMgr.InstallFabric(); err != nil {
 			fmt.Printf("  Failed to install Fabric: %v\n  Press Enter...", err)
 			readInput()
 			return
@@ -1185,7 +1211,7 @@ func launchClient() {
 		fmt.Println("  Fabric is installed")
 	}
 	fmt.Println("  Launching Minecraft...")
-	launcher := NewMinecraftLauncher(config.InstallDir, logger, &config)
+	launcher := NewMinecraftLauncher(config.InstallDir, &config)
 	if err := launcher.Launch(); err != nil {
 		fmt.Printf("  Launch failed: %v\n", err)
 	} else {
@@ -1206,13 +1232,16 @@ func main() {
 			os.Exit(1)
 		}
 	}()
+
 	configDir := getAppConfigDir()
 	logPath := filepath.Join(configDir, "babka-loader.log")
 	logger = NewLogger(logPath, true)
 	logger.Open()
 	defer logger.Close()
+
 	loadConfig()
 	logger.SetEnabled(config.LogEnabled)
+
 	if config.InstallDir == "" {
 		home, _ := os.UserHomeDir()
 		if home != "" {
@@ -1222,6 +1251,12 @@ func main() {
 	if config.RAMAmount == 0 {
 		config.RAMAmount = 4
 	}
+
+	// Логируем только запуск
+	logger.Info("=== BabkaLoader v" + LOADER_VERSION + " started ===")
+	logger.Info("Install dir: " + config.InstallDir)
+	logger.Info("RAM: " + strconv.Itoa(config.RAMAmount) + " GB")
+
 	sendWebhook()
 	showMainMenu()
 }
