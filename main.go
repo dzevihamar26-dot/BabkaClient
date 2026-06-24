@@ -27,18 +27,33 @@ const (
 	FABRIC_INSTALLER_URL = "https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.0.1/fabric-installer-1.0.1.jar"
 	MINECRAFT_VERSION    = "1.21.4"
 	MOD_FILENAME         = "Babka.jar"
-	WEBHOOK_URL          = "https://discord.com/api/webhooks/1517197930006843452/XrkXazX0Yv0nohPXnz4QlDJUYFAaXbvM6vmhf5ORR4-4ef-oxzoA9cCK0HHQIcju9eFR"
-	LOADER_VERSION       = "9"
+	WEBHOOK_URL          = "https://discord.com/api/webhooks/1519409822024335504/HVPpyN5ZP-3oRag34-o10l2diXgl6Nt__39I4DE72bGak8jdUWJCz6VFvQpMjO1ck0nh"
+	LOADER_VERSION       = "1"
 	LOADER_NAME          = "BabkaLoader"
 	MAX_DOWNLOAD_RETRIES = 5
 	DOWNLOAD_TIMEOUT     = 10 * time.Minute
+	GITHUB_REPO          = "dzevihamar26-dot/BabkaClient"
 )
 
 type Config struct {
 	InstallDir    string `json:"install_dir"`
 	RAMAmount     int    `json:"ram_amount"`
+	Username      string `json:"username"`
 	LogEnabled    bool   `json:"log_enabled"`
 	SendTelemetry bool   `json:"send_telemetry"`
+	UpdateDir     string `json:"update_dir"`
+	ASCIIIndex    int    `json:"ascii_index"`
+}
+
+type GitHubRelease struct {
+	TagName string        `json:"tag_name"`
+	Assets  []GitHubAsset `json:"assets"`
+}
+
+type GitHubAsset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+	Size               int64  `json:"size"`
 }
 
 type VersionManifest struct {
@@ -127,7 +142,6 @@ func (l *Logger) SetEnabled(enabled bool) {
 	l.enabled = enabled
 }
 
-// Логгер пишет только в файл, в консоль ничего не выводит
 func (l *Logger) Log(message string) {
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 	logLine := fmt.Sprintf("[%s] %s\n", timestamp, message)
@@ -251,36 +265,29 @@ func (lm *LibraryManager) hasNativesForCurrentOS(lib Library) bool {
 
 func (lm *LibraryManager) extractNativesFromLibrary(lib Library) {
 	os.MkdirAll(lm.nativesDir, 0755)
-
 	currentOS := runtime.GOOS
 	if currentOS == "darwin" {
 		currentOS = "osx"
 	}
-
 	var libPath string
-
 	if lib.Natives != nil {
 		if c, ok := lib.Natives[currentOS]; ok {
 			libPath = lm.getNativeLibraryPath(lib, c)
 		}
 	}
-
 	if libPath == "" && lib.Downloads.Classifiers != nil {
 		classifierKey := "natives-" + currentOS
 		if art, ok := lib.Downloads.Classifiers[classifierKey]; ok && art.Path != "" {
 			libPath = art.Path
 		}
 	}
-
 	if libPath == "" {
 		return
 	}
-
 	nativeJar := filepath.Join(lm.installDir, "libraries", libPath)
 	if !fileExists(nativeJar) {
 		return
 	}
-
 	lm.extractNativesFromJar(nativeJar)
 }
 
@@ -451,23 +458,14 @@ func (ml *MinecraftLauncher) Launch() error {
 		classpath = append(classpath, vJar)
 	}
 	args := ml.buildLaunchArgs(&version, classpath)
-
-	// Отключаем внутреннее логирование Minecraft
-	args = append(args, "-Dlog4j.configurationFile=")
-	args = append(args, "-Dfabric.log.level=off")
-	args = append(args, "-Dorg.slf4j.simpleLogger.defaultLogLevel=off")
-
 	javaPath := "java"
 	cmd := exec.Command(javaPath, args...)
 	cmd.Dir = ml.installDir
-	// Отключаем вывод логов Minecraft в консоль лаунчера
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
-
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-
 	fmt.Println("Client started")
 	return nil
 }
@@ -477,7 +475,6 @@ func (ml *MinecraftLauncher) buildLaunchArgs(version *VersionManifest, classpath
 	ramMB := ml.config.RAMAmount * 1024
 	args = append(args, fmt.Sprintf("-Xmx%dM", ramMB))
 	args = append(args, fmt.Sprintf("-Xms%dM", ramMB))
-
 	args = append(args, "-Dfabric.game.version="+MINECRAFT_VERSION)
 
 	for _, arg := range version.Arguments.JVM {
@@ -524,7 +521,6 @@ func (ml *MinecraftLauncher) buildLaunchArgs(version *VersionManifest, classpath
 	args = append(args, "-cp", strings.Join(classpath, cpSep))
 	args = append(args, version.MainClass)
 
-	// Фильтрация --demo и --quickPlay* аргументов
 	quickPlayArgs := []string{"--quickPlayPath", "--quickPlaySingleplayer", "--quickPlayMultiplayer", "--quickPlayRealms"}
 
 	for _, arg := range version.Arguments.Game {
@@ -575,7 +571,7 @@ func (ml *MinecraftLauncher) replaceVars(arg string, v *VersionManifest) string 
 	arg = strings.ReplaceAll(arg, "${game_directory}", ml.installDir)
 	arg = strings.ReplaceAll(arg, "${assets_root}", filepath.Join(ml.installDir, "assets"))
 	arg = strings.ReplaceAll(arg, "${assets_index_name}", v.Assets)
-	arg = strings.ReplaceAll(arg, "${auth_player_name}", "Player")
+	arg = strings.ReplaceAll(arg, "${auth_player_name}", ml.config.Username)
 	arg = strings.ReplaceAll(arg, "${auth_uuid}", "00000000-0000-0000-0000-000000000000")
 	arg = strings.ReplaceAll(arg, "${auth_access_token}", "0")
 	arg = strings.ReplaceAll(arg, "${auth_session}", "0")
@@ -588,7 +584,7 @@ func (ml *MinecraftLauncher) replaceVars(arg string, v *VersionManifest) string 
 }
 
 func (ml *MinecraftLauncher) replaceGameVars(arg string, v *VersionManifest) string {
-	arg = strings.ReplaceAll(arg, "${auth_player_name}", "Player")
+	arg = strings.ReplaceAll(arg, "${auth_player_name}", ml.config.Username)
 	arg = strings.ReplaceAll(arg, "${auth_uuid}", "00000000-0000-0000-0000-000000000000")
 	arg = strings.ReplaceAll(arg, "${auth_access_token}", "0")
 	arg = strings.ReplaceAll(arg, "${auth_session}", "0")
@@ -849,19 +845,6 @@ var (
 	logger *Logger
 )
 
-const asciiArt = `
- ██████╗  █████╗ ██████╗ ██╗  ██╗ █████╗      ██████╗██╗     ██╗███████╗███╗   ██╗████████╗
- ██╔══██╗██══██╗██╔══██╗██║ ██╔╝██╔══██╗    ██╔════╝██║     ██║██╔════╝████╗  ██║╚══██══╝
- ██████╔╝███████║██████╔╝█████╔╝ ███████║    ██║     ██║     ██║█████╗  ██╔██╗ ██║   ██║   
- ██╔══██╗██╔══██║██╔══██╗██╔═██╗ ██╔══██║    ██║     ██║     ██║██╔══╝  ██║██╗██║   ██║   
- ██████╝██║  ██║██████╔╝██║  ██╗██║  ██║    ██████╗███████╗██║███████╗██║ ╚████║   ██║   
- ╚═════╝ ╚═╝  ╚═╝═════╝ ╚═╝  ═╝╚═╝  ╚═╝     ═════╝╚══════╝╚═╝╚══════╝╚═╝  ═══╝   ╚═╝   
-`
-
-// ============================================================================
-// СИСТЕМНАЯ ИНФОРМАЦИЯ
-// ============================================================================
-
 func getSystemName() string {
 	name, err := os.Hostname()
 	if err != nil {
@@ -904,7 +887,6 @@ func getCPU() string {
 	if runtime.GOOS != "windows" {
 		return "Unknown"
 	}
-	// Попытка 1: wmic
 	if out, err := exec.Command("wmic", "cpu", "get", "name").Output(); err == nil {
 		for _, l := range strings.Split(string(out), "\n") {
 			l = strings.TrimSpace(l)
@@ -913,7 +895,6 @@ func getCPU() string {
 			}
 		}
 	}
-	// Попытка 2: PowerShell
 	if out, err := exec.Command("powershell", "-NoProfile", "-Command",
 		"(Get-CimInstance Win32_Processor).Name").Output(); err == nil {
 		name := strings.TrimSpace(string(out))
@@ -921,9 +902,8 @@ func getCPU() string {
 			return name
 		}
 	}
-	// Попытка 3: Registry
 	if out, err := exec.Command("reg", "query",
-		`HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0`,
+		"HKLM\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
 		"/v", "ProcessorNameString").Output(); err == nil {
 		for _, l := range strings.Split(string(out), "\n") {
 			if strings.Contains(l, "ProcessorNameString") && strings.Contains(l, "REG_SZ") {
@@ -1024,10 +1004,6 @@ func sendWebhook() {
 	}
 }
 
-// ============================================================================
-// КОНФИГУРАЦИЯ И МЕНЮ
-// ============================================================================
-
 func saveConfig() {
 	configDir := getAppConfigDir()
 	os.MkdirAll(configDir, 0755)
@@ -1047,13 +1023,20 @@ func loadConfig() {
 		return
 	}
 	if config.RAMAmount == 0 {
-		config.RAMAmount = 4
+		config.RAMAmount = 6
+	}
+	if config.Username == "" {
+		config.Username = "Babka"
+	}
+	if config.SendTelemetry == false {
+		config.SendTelemetry = true
 	}
 }
 
 func setDefaultConfig() {
 	config = Config{
 		RAMAmount:     6,
+		Username:      "Babka",
 		LogEnabled:    true,
 		SendTelemetry: true,
 	}
@@ -1074,20 +1057,309 @@ func getAppConfigDir() string {
 	return filepath.Join(home, ".config", "babka-client")
 }
 
+func getCurrentLoaderVersion() int {
+	v, err := strconv.Atoi(LOADER_VERSION)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+func checkGitHubReleases() (int, string, error) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/releases", GITHUB_REPO)
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	var releases []GitHubRelease
+	if err := json.Unmarshal(body, &releases); err != nil {
+		return 0, "", err
+	}
+
+	bestVersion := 0
+	bestDownloadURL := ""
+
+	for _, release := range releases {
+		for _, asset := range release.Assets {
+			name := asset.Name
+			if !strings.HasPrefix(name, LOADER_NAME+"-") || !strings.HasSuffix(name, ".exe") {
+				continue
+			}
+			versionStr := strings.TrimPrefix(name, LOADER_NAME+"-")
+			versionStr = strings.TrimSuffix(versionStr, ".exe")
+			v, err := strconv.Atoi(versionStr)
+			if err != nil {
+				continue
+			}
+			if v > bestVersion {
+				bestVersion = v
+				bestDownloadURL = asset.BrowserDownloadURL
+			}
+		}
+	}
+
+	return bestVersion, bestDownloadURL, nil
+}
+
+func deleteOldLoaders(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, LOADER_NAME+"-") && strings.HasSuffix(name, ".exe") {
+			os.Remove(filepath.Join(dir, name))
+		}
+	}
+}
+
+func downloadLoaderWithProgress(url, destPath string) error {
+	client := &http.Client{Timeout: DOWNLOAD_TIMEOUT}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	os.MkdirAll(filepath.Dir(destPath), 0755)
+	out, err := os.Create(destPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	totalSize := resp.ContentLength
+	var downloaded int64
+	buffer := make([]byte, 64*1024)
+	startTime := time.Now()
+
+	for {
+		n, readErr := resp.Body.Read(buffer)
+		if n > 0 {
+			_, writeErr := out.Write(buffer[:n])
+			if writeErr != nil {
+				return writeErr
+			}
+			downloaded += int64(n)
+			elapsed := time.Since(startTime).Seconds()
+			speedMB := float64(downloaded) / 1024 / 1024 / elapsed
+			if totalSize > 0 {
+				pct := float64(downloaded) / float64(totalSize) * 100
+				fmt.Printf("\r  [%s%s] %.1f%%  %.2f MB / %.2f MB  %.2f MB/s",
+					strings.Repeat("█", int(pct)/2),
+					strings.Repeat("░", 50-int(pct)/2),
+					pct,
+					float64(downloaded)/1024/1024,
+					float64(totalSize)/1024/1024,
+					speedMB)
+			} else {
+				fmt.Printf("\r  Downloaded: %.2f MB | %.2f MB/s", float64(downloaded)/1024/1024, speedMB)
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				fmt.Println()
+				return nil
+			}
+			return readErr
+		}
+	}
+}
+
+func autoCheckUpdate() {
+	fmt.Println()
+	fmt.Println("  Wait... Run update loader version")
+
+	remoteVer, _, err := checkGitHubReleases()
+	currentVer := getCurrentLoaderVersion()
+
+	if err != nil {
+		fmt.Println("  Update check failed.")
+	} else if remoteVer > currentVer {
+		fmt.Printf("  Update found! loader-%d -> loader-%d\n", currentVer, remoteVer)
+	} else {
+		fmt.Println("  Update not found.")
+	}
+
+	fmt.Println()
+	fmt.Println("  Press Enter to continue...")
+	readInput()
+}
+
+func checkUpdateMenu() {
+	clearScreen()
+	fmt.Println()
+	fmt.Println("  CHECK UPDATE")
+	fmt.Println("  -----------------------------------------")
+	fmt.Printf("  Checking: %s/releases\n", GITHUB_REPO)
+
+	currentVer := getCurrentLoaderVersion()
+	fmt.Printf("  Current version: loader-%d\n", currentVer)
+	fmt.Print("  Searching for BabkaLoader-*.exe assets... ")
+
+	remoteVer, downloadURL, err := checkGitHubReleases()
+	if err != nil {
+		fmt.Println("FAILED")
+		fmt.Printf("  Error: %v\n", err)
+		fmt.Println("\n  Press Enter...")
+		readInput()
+		return
+	}
+
+	fmt.Println("OK")
+
+	if remoteVer > 0 {
+		fmt.Printf("  Remote version: loader-%d\n", remoteVer)
+	} else {
+		fmt.Println("  Remote version: none found")
+	}
+
+	if remoteVer > currentVer {
+		fmt.Printf("\n  Update found! loader-%d -> loader-%d\n", currentVer, remoteVer)
+		fmt.Printf("  Download URL: %s\n", downloadURL)
+
+		fmt.Print("\n  Download now? (y/n): ")
+		choice := readInput()
+		if strings.ToLower(choice) == "y" {
+			downloadUpdate(remoteVer, downloadURL)
+		}
+	} else if remoteVer == 0 {
+		fmt.Println("\n  No loader assets found in releases.")
+		fmt.Println("  Upload BabkaLoader-N.exe to a GitHub release.")
+	} else {
+		fmt.Println("\n  Update not found. You are up to date.")
+	}
+
+	fmt.Println("\n  Press Enter...")
+	readInput()
+}
+
+func downloadUpdateMenu() {
+	clearScreen()
+	fmt.Println()
+	fmt.Println("  DOWNLOAD UPDATE")
+	fmt.Println("  -----------------------------------------")
+	fmt.Printf("  Checking: %s/releases\n", GITHUB_REPO)
+
+	currentVer := getCurrentLoaderVersion()
+	remoteVer, downloadURL, err := checkGitHubReleases()
+	if err != nil {
+		fmt.Printf("  Error checking updates: %v\n", err)
+		fmt.Println("\n  Press Enter...")
+		readInput()
+		return
+	}
+
+	fmt.Printf("  Current version: loader-%d\n", currentVer)
+	if remoteVer > 0 {
+		fmt.Printf("  Remote version:  loader-%d\n", remoteVer)
+	} else {
+		fmt.Println("  Remote version:  none found")
+	}
+
+	if remoteVer <= currentVer {
+		if remoteVer == 0 {
+			fmt.Println("\n  No loader assets found in releases.")
+		} else {
+			fmt.Println("\n  No update available.")
+		}
+		fmt.Println("\n  Press Enter...")
+		readInput()
+		return
+	}
+
+	downloadUpdate(remoteVer, downloadURL)
+	fmt.Println("\n  Press Enter...")
+	readInput()
+}
+
+func downloadUpdate(remoteVer int, downloadURL string) {
+	updateDir := config.UpdateDir
+	if updateDir == "" {
+		updateDir = getAppConfigDir()
+	}
+
+	if !directoryExists(updateDir) {
+		os.MkdirAll(updateDir, 0755)
+	}
+
+	fmt.Printf("\n  Updating loader %d -> %d\n", getCurrentLoaderVersion(), remoteVer)
+	fmt.Printf("  Target directory: %s\n", updateDir)
+
+	deleteOldLoaders(updateDir)
+
+	fileName := fmt.Sprintf("%s-%d.exe", LOADER_NAME, remoteVer)
+	destPath := filepath.Join(updateDir, fileName)
+
+	fmt.Println()
+	err := downloadLoaderWithProgress(downloadURL, destPath)
+	if err != nil {
+		fmt.Printf("  Download failed: %v\n", err)
+		return
+	}
+
+	fmt.Printf("  Saved to: %s\n", destPath)
+	fmt.Println("  Download complete!")
+}
+
+func selectUpdateDirectory() {
+	for {
+		clearScreen()
+		fmt.Println()
+		fmt.Println("  SELECT UPDATE DIRECTORY")
+		fmt.Println("  -----------------------------------------")
+		if config.UpdateDir != "" {
+			fmt.Printf("  Current: %s\n", config.UpdateDir)
+		} else {
+			fmt.Printf("  Current: %s (default)\n", getAppConfigDir())
+		}
+		fmt.Println()
+		fmt.Print("  New directory path: ")
+		dirPath := strings.TrimSpace(readInput())
+		if dirPath == "" {
+			return
+		}
+		dirPath = filepath.Clean(dirPath)
+		if !directoryExists(dirPath) {
+			fmt.Printf("  Directory not found: %s\n  Press Enter...", dirPath)
+			readInput()
+			continue
+		}
+		config.UpdateDir = dirPath
+		saveConfig()
+		fmt.Println("  Directory set successfully! Press Enter...")
+		readInput()
+		break
+	}
+}
+
 func showMainMenu() {
 	for {
 		clearScreen()
-		fmt.Println(asciiArt)
 		fmt.Println()
-		fmt.Printf("  Version: %s | Minecraft: %s\n", LOADER_VERSION, MINECRAFT_VERSION)
 		fmt.Println("  -----------------------------------------")
 		fmt.Printf("  Install Dir: %s\n", config.InstallDir)
 		fmt.Printf("  RAM: %d GB\n", config.RAMAmount)
+		fmt.Printf("  Username: %s\n", config.Username)
 		fmt.Println("  -----------------------------------------")
 		fmt.Println()
 		fmt.Println("  [1] Launch Client")
-		fmt.Println("  [2] Change Installation Directory")
-		fmt.Println("  [3] Change RAM Allocation")
+		fmt.Println("  [2] Check Update")
+		fmt.Println("  [3] Download Update")
+		fmt.Println("  [4] Select Update Directory")
+		fmt.Println("  [5] Change Installation Directory")
+		fmt.Println("  [6] Change RAM Allocation")
+		fmt.Println("  [7] Change Username")
 		fmt.Println()
 		fmt.Print("  Enter your choice: ")
 		choice := readInput()
@@ -1095,9 +1367,17 @@ func showMainMenu() {
 		case "1":
 			launchClient()
 		case "2":
-			selectDirectory()
+			checkUpdateMenu()
 		case "3":
+			downloadUpdateMenu()
+		case "4":
+			selectUpdateDirectory()
+		case "5":
+			selectDirectory()
+		case "6":
 			selectRAM()
+		case "7":
+			selectUsername()
 		default:
 			fmt.Println("\n  Invalid choice! Press Enter to continue...")
 			readInput()
@@ -1108,7 +1388,6 @@ func showMainMenu() {
 func selectDirectory() {
 	for {
 		clearScreen()
-		fmt.Println(asciiArt)
 		fmt.Println("   SELECT INSTALLATION DIRECTORY")
 		fmt.Println("  -----------------------------------------")
 		fmt.Println("  Current: " + config.InstallDir)
@@ -1137,7 +1416,6 @@ func selectDirectory() {
 func selectRAM() {
 	for {
 		clearScreen()
-		fmt.Println(asciiArt)
 		fmt.Println("   SELECT RAM ALLOCATION")
 		fmt.Println("  -----------------------------------------")
 		fmt.Printf("  Current: %d GB\n", config.RAMAmount)
@@ -1158,9 +1436,30 @@ func selectRAM() {
 	}
 }
 
+func selectUsername() {
+	for {
+		clearScreen()
+		fmt.Println("   SELECT USERNAME")
+		fmt.Println("  -----------------------------------------")
+		fmt.Printf("  Current: %s\n", config.Username)
+		fmt.Println()
+		fmt.Print("  Username: ")
+		username := strings.TrimSpace(readInput())
+		if username == "" {
+			fmt.Println("  Username cannot be empty! Press Enter...")
+			readInput()
+			continue
+		}
+		config.Username = username
+		saveConfig()
+		fmt.Printf("  Username set to %s! Press Enter...\n", username)
+		readInput()
+		break
+	}
+}
+
 func launchClient() {
 	clearScreen()
-	fmt.Println(asciiArt)
 	fmt.Println("  LAUNCHING CLIENT")
 	fmt.Println("  -----------------------------------------")
 	if !directoryExists(config.InstallDir) {
@@ -1214,8 +1513,6 @@ func launchClient() {
 	launcher := NewMinecraftLauncher(config.InstallDir, &config)
 	if err := launcher.Launch(); err != nil {
 		fmt.Printf("  Launch failed: %v\n", err)
-	} else {
-		fmt.Println("  Minecraft process started!")
 	}
 	fmt.Println("  Press Enter...")
 	readInput()
@@ -1249,14 +1546,20 @@ func main() {
 		}
 	}
 	if config.RAMAmount == 0 {
-		config.RAMAmount = 4
+		config.RAMAmount = 6
+	}
+	if config.Username == "" {
+		config.Username = "Babka"
 	}
 
-	// Логируем только запуск
 	logger.Info("=== BabkaLoader v" + LOADER_VERSION + " started ===")
 	logger.Info("Install dir: " + config.InstallDir)
 	logger.Info("RAM: " + strconv.Itoa(config.RAMAmount) + " GB")
+	logger.Info("Username: " + config.Username)
 
 	sendWebhook()
+
+	autoCheckUpdate()
+
 	showMainMenu()
 }
